@@ -2,11 +2,15 @@
 
 TCP forwarder with two kinds of connections:
 
-| Role in code | Meaning |
-|--------------|---------|
-| **RcvClientCon** | Connection **accepted** on `LISTEN_PORT` (downstream client: telnet, `nc`, etc.). |
-| **SendClientConSrvA** | Outbound TCP to **`SERVER_A`** (required **for that session**). Traffic is forwarded both ways; upstream replies return to the Rcv client. |
-| **SendClientConSrvB** | Outbound TCP to **`SERVER_B`** (optional). Duplicate send path only; upstream replies are **not** relayed back. |
+|-----------------------|-----------------------------------------------------------------------------------|
+| Role in code          | Meaning                                                                           |
+|-----------------------|-----------------------------------------------------------------------------------|
+| **RcvClientCon**      | Connection **accepted** on `LISTEN_PORT` (downstream client: telnet, `nc`, etc.). |
+| **SendClientConSrvA** | Outbound TCP to **`SERVER_A`** (required **for that session**).                   |
+|                       |        Traffic is forwarded both ways; upstream replies return to the Rcv client. |
+| **SendClientConSrvB** | Outbound TCP to **`SERVER_B`** (optional). Duplicate send path only;              |
+|                       |        upstream replies are **not** relayed back.                                 |
+|-----------------------|-----------------------------------------------------------------------------------|
 
 The implementation uses a base class **`SendClientConnection`** for those outbound sockets. Config still uses **`SERVER_A`** / **`SERVER_B`** as `(host, port)` endpoints.
 
@@ -16,6 +20,12 @@ The implementation uses a base class **`SendClientConnection`** for those outbou
 
 - Python 3.x  
 - Standard library only (`socket`, `select`, `threading`, …)
+
+## Versioning
+
+- **Current version:** `__version__` in `IPSignalDuplicatorServer.py` (printed once at startup).
+- **Release notes:** [CHANGELOG.md](CHANGELOG.md) ([Keep a Changelog](https://keepachangelog.com/) style).
+- **Source history:** `git log`. Tag releases with `vMAJOR.MINOR.PATCH` when you publish a milestone.
 
 ## Configuration
 
@@ -53,6 +63,10 @@ There is **no startup probe** to **`SERVER_A`**. The listener accepts **RcvClien
 - If **SendClientConSrvB** drops, that session continues while a background thread retries **`SERVER_B`** using `RECONNECT_DELAY`.
 
 Stop with **Ctrl+C** (all active sessions are signalled to exit).
+
+### Linux service (Debian 12 / systemd)
+
+See **[deploy/debian12/README.md](deploy/debian12/README.md)** for a **systemd** unit (`ip-signal-duplicator.service`), dedicated user setup, and journald logging.
 
 ## Testing with `IPTestServer.py`
 

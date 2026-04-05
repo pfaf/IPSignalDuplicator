@@ -1,70 +1,9 @@
 #!/usr/bin/env python3
-#######################################################
-### IPSignalDuplicatorServer.py v0.62
-#######################################################
-### Software to receive text on one port
-### and forward it to two servers.
-### Responses are returned only from the first server.
-###
-### Original code from DeepSeek on 2-4-2026
-### coordinated by PFaf (pfaf@wisdomsoftware.net)
-###
-### License GNU GPL v3
-###
-#######################################################
-###
-### Instructions:
-### Run the forwarder:
-###bash
-#### Make it executable
-###chmod +x /usr/local/bin/bi-forwarder.py
-###
-#### Run it
-###python3 /usr/local/bin/bi-forwarder.py
-###
-#############################################
-###
-### Run as a systemd service:
-### Create /etc/systemd/system/tcp-forwarder.service:
-###
-###ini
-###[Unit]
-###Description=TCP Bidirectional Forwarder
-###After=network.target
-###
-###[Service]
-###Type=simple
-###ExecStart=/usr/bin/python3 /usr/local/bin/bi-forwarder.py
-###Restart=always
-###RestartSec=5
-###User=nobody
-###
-###[Install]
-###WantedBy=multi-user.target
-###Enable and start:
-###
-###bash
-###sudo systemctl daemon-reload
-###sudo systemctl enable tcp-forwarder
-###sudo systemctl start tcp-forwarder
-###
-#######################################################
-###
-### Version History
-###
-### v0.62 - 20260402 / PFaf + DeepSeek
-### - Trying to fix disconnection and termination problems
-#######
-### v0.61 - 20260402 / PFaf + DeepSeek
-### - Added code to handle Broken Pipe Handling "[Server A] Send error: [Errno 32] Broken pipe"
-#######
-### v0.60 - 20260402 / PFaf + DeepSeek
-### - Added bug trace traps and logging for the SERVER_A responses
-#######
-### v0.50 - 20260402 / PFaf + DeepSeek
-### - Initial script version to be tested on Group8 systems
-###
-#######################################################
+# SPDX-License-Identifier: GPL-3.0-only
+#
+# IPSignalDuplicatorServer — TCP forwarder (RcvClientCon ↔ SendClientConSrvA / SendClientConSrvB).
+# Copyright and version history: see LICENSE and CHANGELOG.md.
+# Original prototype assisted by DeepSeek; coordinated by PFaf (pfaf@wisdomsoftware.net).
 
 """
 TCP forwarder: RcvClientCon (accepted on LISTEN_PORT) ↔ SendClientConSrvA + SendClientConSrvB (optional).
@@ -74,7 +13,11 @@ one connection, additional Rcv clients get SendClientConSrvA connect failures an
 
 If SendClientConSrvA for a session is lost, only that RcvClientCon is torn down. SendClientConSrvB can
 reconnect in the background without dropping the Rcv session.
+
+Run: ``python IPSignalDuplicatorServer.py`` (configure ``config.py`` first). For systemd, see README.md.
 """
+
+__version__ = "0.7.0"
 
 import socket
 import select
@@ -173,11 +116,6 @@ class SessionRegistry:
         """Return a shallow copy of session dicts for display or debugging."""
         with self._lock:
             return [dict(e) for e in self._sessions]
-
-
-#######################################################
-### Nothing should be changed below this line normally
-#######################################################
 
 
 class RcvClientCon:
@@ -567,7 +505,7 @@ def main():
     server.listen(5)
     session_registry = SessionRegistry()
 
-    print(f"🚀 TCP Forwarder listening on port {LISTEN_PORT}")
+    print(f"🚀 IPSignalDuplicatorServer {__version__} — listening on port {LISTEN_PORT}")
     print(f"📡 SERVER_A {SERVER_A[0]}:{SERVER_A[1]} — each RcvClientCon opens its own SendClientConSrvA")
     print(f"📡 SERVER_B {SERVER_B[0]}:{SERVER_B[1]} — optional; SendClientConSrvB may reconnect per session")
     print("\nWaiting for RcvClientCon connections (no startup probe to SERVER_A)...\n")
