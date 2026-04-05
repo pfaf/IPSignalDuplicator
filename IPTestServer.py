@@ -36,41 +36,48 @@ def main():
     while True:
         client, addr = server.accept()
         print(f"📞 Server A: Client connected from {addr}")
-        
-        # Send welcome message
-        client.send(b"Welcome to Test Server A\r\n")
-        client.send(b"Type 'help' for commands\r\n> ")
-        
-        while True:
+        try:
             try:
-                data = client.recv(1024)
-                if not data:
-                    break
-                
-                message = data.decode().strip()
-                print(f"Server A received: {message}")
-                
-                # Send different responses based on input
-                if message.lower() == 'help':
-                    response = "Commands: help, time, echo, quit\r\n> "
-                elif message.lower() == 'time':
-                    response = f"Server time: {time.ctime()}\r\n> "
-                elif message.lower().startswith('echo'):
-                    response = f"You said: {message[5:]}\r\n> "
-                elif message.lower() == 'quit':
-                    response = "Goodbye!\r\n"
-                    client.send(response.encode())
-                    break
-                else:
-                    response = f"Unknown command: {message}\r\n> "
-                
-                client.send(response.encode())
-                
-            except Exception as e:
-                print(f"Server A error: {e}")
-                break
-        
-        client.close()
+                client.sendall(b"Welcome to Test Server A\r\n")
+                client.sendall(b"Type 'help' for commands\r\n> ")
+            except (BrokenPipeError, ConnectionResetError, OSError) as e:
+                print(f"Server A: peer closed before banner (e.g. health probe): {e!r}")
+            else:
+                while True:
+                    try:
+                        data = client.recv(1024)
+                        if not data:
+                            break
+
+                        message = data.decode().strip()
+                        print(f"Server A received: {message}")
+
+                        if message.lower() == "help":
+                            response = "Commands: help, time, echo, quit\r\n> "
+                        elif message.lower() == "time":
+                            response = f"Server time: {time.ctime()}\r\n> "
+                        elif message.lower().startswith("echo"):
+                            response = f"You said: {message[5:]}\r\n> "
+                        elif message.lower() == "quit":
+                            response = "Goodbye!\r\n"
+                            client.sendall(response.encode())
+                            break
+                        else:
+                            response = f"Unknown command: {message}\r\n> "
+
+                        client.sendall(response.encode())
+
+                    except (BrokenPipeError, ConnectionResetError, OSError) as e:
+                        print(f"Server A I/O error: {e!r}")
+                        break
+                    except Exception as e:
+                        print(f"Server A error: {e}")
+                        break
+        finally:
+            try:
+                client.close()
+            except OSError:
+                pass
         print("Server A: Client disconnected\n")
 
 if __name__ == '__main__':

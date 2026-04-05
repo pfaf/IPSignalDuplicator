@@ -1,6 +1,16 @@
 # IPSignalDuplicator
 
-TCP forwarder: it accepts client connections on one port, forwards each client’s traffic to **Server A** (required, bidirectional) and **Server B** (optional, receive-only). Replies from **Server A** are sent back to the client; traffic to **Server B** is not relayed back.
+TCP forwarder with two kinds of connections:
+
+| Role in code | Meaning |
+|--------------|---------|
+| **RcvClientCon** | Connection **accepted** on `LISTEN_PORT` (downstream client: telnet, `nc`, etc.). |
+| **SendClientConSrvA** | Outbound TCP to **`SERVER_A`** (required **for that session**). Traffic is forwarded both ways; upstream replies return to the Rcv client. |
+| **SendClientConSrvB** | Outbound TCP to **`SERVER_B`** (optional). Duplicate send path only; upstream replies are **not** relayed back. |
+
+The implementation uses a base class **`SendClientConnection`** for those outbound sockets. Config still uses **`SERVER_A`** / **`SERVER_B`** as `(host, port)` endpoints.
+
+**Session registry:** Each accepted Rcv client gets a row in an in-memory **`SessionRegistry`** (`rcv_addr`, `srv_a` / `srv_b` status strings such as `pending`, `connected`, `failed`, `closed`). Entries are removed when the session ends. For debugging you can call **`snapshot_sessions()`** on the registry from a breakpoint or future admin hook (not exposed on the CLI today).
 
 ## Requirements
 
@@ -13,17 +23,17 @@ Edit **`config.py`** in the same directory as the server script.
 
 | Setting | Purpose |
 |--------|---------|
-| `LISTEN_PORT` | Port clients connect to (e.g. telnet/nc). |
-| `SERVER_A` | `(host, port)` — must be reachable; responses return to clients. |
-| `SERVER_B` | `(host, port)` — optional duplicate sink; reconnects per client if it drops. |
-| `CONNECT_TIMEOUT` | Seconds to wait when opening upstream TCP connections. |
-| `RECONNECT_DELAY` | Seconds between retries when probing **Server A** after an outage, and between **Server B** reconnect attempts. |
-| `SELECT_TIMEOUT` | Main loop poll interval (seconds) for client and Server A I/O. |
-| `LOG_RESPONSES` | If `True`, log Server A responses under `LOG_DIRECTORY`. |
+| `LISTEN_PORT` | Port where **RcvClientCon** sessions are accepted. |
+| `SERVER_A` | `(host, port)` for **SendClientConSrvA** — each new Rcv client attempts its own connect; success depends on upstream policy (e.g. single-connection servers). |
+| `SERVER_B` | `(host, port)` for **SendClientConSrvB** — optional; reconnects per session if it drops. |
+| `CONNECT_TIMEOUT` | Seconds to wait when opening each **SendClientConnection**. |
+| `RECONNECT_DELAY` | Delay between **SendClientConSrvB** reconnect attempts in the maintainer thread. |
+| `SELECT_TIMEOUT` | Poll interval (seconds) for Rcv + Srv A I/O in the session main loop. |
+| `LOG_RESPONSES` | If `True`, log data read from **SendClientConSrvA** under `LOG_DIRECTORY`. |
 | `LOG_DIRECTORY`, `LOG_PREFIX` | Log folder and file name prefix (`{LOG_PREFIX}_{LOG_FNAME_TS_FORMAT}.log`). |
 | `LOG_TIMESTAMP_FORMAT` | Timestamp format inside each log line. |
 | `LOG_FNAME_TS_FORMAT` | Date/time fragment used in the log **file name**. |
-| `SEND_DISCONNECT_NOTIFICATION`, `DISCONNECT_MESSAGE` | Optional message to clients when Server A is lost. |
+| `SEND_DISCONNECT_NOTIFICATION`, `DISCONNECT_MESSAGE` | Optional notice to **RcvClientCon** when **that session’s** SendClientConSrvA drops after having been connected. |
 | `DEBUG` | Extra debug prints when `True`. |
 
 Paths like `LOG_DIRECTORY` are resolved relative to the **process working directory**, not necessarily the script folder.
@@ -36,13 +46,17 @@ From this project directory:
 python IPSignalDuplicatorServer.py
 ```
 
-The process will **not accept clients** until **Server A** answers a short TCP probe. If Server A goes down while clients are connected, **all** client sessions are closed and **new connections are refused** until Server A is reachable again. If **Server B** drops, each client session keeps running and a background thread retries **Server B** using `RECONNECT_DELAY`.
+There is **no startup probe** to **`SERVER_A`**. The listener accepts **RcvClientCon** connections immediately; each session then tries **`SendClientConSrvA.connect()`** to **`SERVER_A`**.
 
-Stop with **Ctrl+C**.
+- If **`SERVER_A` only allows one connection**, the first Rcv client may succeed and later clients fail that connect step — **only the failing Rcv client** is closed (no global shutdown).
+- If **SendClientConSrvA** for a session is lost **after** it connected, **only that RcvClientCon** is torn down (optional `DISCONNECT_MESSAGE`); other sessions keep running.
+- If **SendClientConSrvB** drops, that session continues while a background thread retries **`SERVER_B`** using `RECONNECT_DELAY`.
+
+Stop with **Ctrl+C** (all active sessions are signalled to exit).
 
 ## Testing with `IPTestServer.py`
 
-`IPTestServer.py` is a small interactive TCP server (help / time / echo / quit) useful as a stand-in for **Server A** or **Server B**.
+`IPTestServer.py` is a small interactive TCP server (help / time / echo / quit). Use it as a stand-in for the host behind **`SERVER_A`** or **`SERVER_B`**.
 
 ```bash
 # Default listen port 9996
@@ -57,7 +71,7 @@ Typical local check:
 1. Set `SERVER_A` in `config.py` to `('127.0.0.1', 9996)` (or your chosen port).  
 2. Start `python IPTestServer.py` (same port).  
 3. Start `python IPSignalDuplicatorServer.py`.  
-4. Connect a client to `LISTEN_PORT` (e.g. `nc 127.0.0.1 8010` or telnet).
+4. Connect a **RcvClientCon** client to `LISTEN_PORT` (e.g. `nc 127.0.0.1 8010` or telnet).
 
 ## License
 

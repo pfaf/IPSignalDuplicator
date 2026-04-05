@@ -67,9 +67,13 @@
 #######################################################
 
 """
-TCP forwarder: clients → Server A (required) + Server B (optional).
-If Server A goes down, all clients are closed and new accepts pause until A is reachable again.
-If Server B goes down, each client session keeps running while a background thread reconnects B.
+TCP forwarder: RcvClientCon (accepted on LISTEN_PORT) ↔ SendClientConSrvA + SendClientConSrvB (optional).
+
+Each RcvClientCon triggers its own connection attempts to SERVER_A / SERVER_B. If SERVER_A only accepts
+one connection, additional Rcv clients get SendClientConSrvA connect failures and are dropped alone.
+
+If SendClientConSrvA for a session is lost, only that RcvClientCon is torn down. SendClientConSrvB can
+reconnect in the background without dropping the Rcv session.
 """
 
 import socket
@@ -118,45 +122,35 @@ def debug_print(msg):
         print(f"[DEBUG] {msg}")
 
 
-def probe_server_a_connection():
-    """Return True if a new TCP connection to Server A can be established (then closed)."""
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.settimeout(CONNECT_TIMEOUT)
-    try:
-        s.connect(SERVER_A)
-        return True
-    except OSError as e:
-        debug_print(f"Server A probe failed: {e!r}")
-        return False
-    finally:
-        try:
-            s.close()
-        except OSError:
-            pass
-
-
-def wait_until_server_a_available():
-    """Block until Server A accepts a probe connection; sleep RECONNECT_DELAY between failures."""
-    attempt = 0
-    while True:
-        attempt += 1
-        print(f"🔍 Probing Server A at {SERVER_A[0]}:{SERVER_A[1]} (attempt {attempt})...")
-        if probe_server_a_connection():
-            print(f"✅ Server A is reachable.")
-            return
-        print(f"⏳ Server A not reachable; retrying in {RECONNECT_DELAY}s...")
-        time.sleep(RECONNECT_DELAY)
-
-
-class ServiceController:
-    """Coordinates accept gating when Server A is down and global client teardown."""
+class SessionRegistry:
+    """Thread-safe list of active sessions: RcvClientCon address + SendClientConSrvA/B status strings."""
 
     def __init__(self):
         self._lock = threading.Lock()
-        self.accept_allowed = threading.Event()
-        self._crisis = False
-        self._shutdown = False
+        self._sessions = []
         self._forwarders = set()
+        self._shutdown = False
+
+    def session_add(self, rcv_addr):
+        entry = {
+            "rcv_addr": rcv_addr,
+            "srv_a": "pending",
+            "srv_b": "pending",
+        }
+        with self._lock:
+            self._sessions.append(entry)
+        return entry
+
+    def session_update(self, entry, **kwargs):
+        with self._lock:
+            entry.update(kwargs)
+
+    def session_remove(self, entry):
+        with self._lock:
+            try:
+                self._sessions.remove(entry)
+            except ValueError:
+                pass
 
     def register_forwarder(self, fw):
         with self._lock:
@@ -166,42 +160,39 @@ class ServiceController:
         with self._lock:
             self._forwarders.discard(fw)
 
-    def begin_accepting_clients(self):
-        with self._lock:
-            self._crisis = False
-            self.accept_allowed.set()
-
-    def on_server_a_unreachable(self):
-        with self._lock:
-            if self._shutdown or self._crisis:
-                return
-            self._crisis = True
-            self.accept_allowed.clear()
-            targets = list(self._forwarders)
-        print(
-            "⚠️  Server A unreachable — closing all client sessions; "
-            "new connections paused until Server A is reachable again."
-        )
-        for fw in targets:
-            fw.force_stop_due_to_server_a()
-
     def shutdown_for_exit(self):
         with self._lock:
             if self._shutdown:
                 return
             self._shutdown = True
-            self.accept_allowed.clear()
-            self._crisis = True
             targets = list(self._forwarders)
         for fw in targets:
-            fw.force_stop_due_to_server_a()
+            fw.force_shutdown_rcv(notify=False)
+
+    def snapshot_sessions(self):
+        """Return a shallow copy of session dicts for display or debugging."""
+        with self._lock:
+            return [dict(e) for e in self._sessions]
 
 
 #######################################################
 ### Nothing should be changed below this line normally
 #######################################################
 
-class ConnectionManager:
+
+class RcvClientCon:
+    """Inbound TCP session accepted from the downstream client (connects to LISTEN_PORT)."""
+
+    __slots__ = ("sock", "addr")
+
+    def __init__(self, sock, addr):
+        self.sock = sock
+        self.addr = addr
+
+
+class SendClientConnection:
+    """Outbound TCP connection initiated by this process toward an upstream server (client role)."""
+
     def __init__(self, name, address, callback=None, required=False):
         self.name = name
         self.address = address
@@ -337,18 +328,32 @@ class ConnectionManager:
         self.running = False
         self.disconnect()
 
+
+class SendClientConSrvA(SendClientConnection):
+    """Send-side client connection to upstream SERVER_A (bidirectional; replies go to RcvClientCon)."""
+
+    def __init__(self, on_upstream_data):
+        super().__init__("SendClientConSrvA", SERVER_A, on_upstream_data, True)
+
+
+class SendClientConSrvB(SendClientConnection):
+    """Send-side client connection to upstream SERVER_B (receive-only duplicate path)."""
+
+    def __init__(self):
+        super().__init__("SendClientConSrvB", SERVER_B, None, False)
+
+
 class BidirectionalForwarder:
-    def __init__(self, client_sock, client_addr, controller):
-        self.client_sock = client_sock
-        self.client_addr = client_addr
-        self.controller = controller
+    def __init__(self, rcv_client_con, session_registry):
+        self.rcv_client_con = rcv_client_con
+        self.session_registry = session_registry
         self.running = True
         self.log_file = None
         self._force_stopped = False
         self._stop_lock = threading.Lock()
 
-        self.server_a = ConnectionManager("Server A", SERVER_A, self.handle_server_a_data, True)
-        self.server_b = ConnectionManager("Server B", SERVER_B, None, False)
+        self.send_client_con_srv_a = SendClientConSrvA(self.handle_send_client_con_srv_a_data)
+        self.send_client_con_srv_b = SendClientConSrvB()
         
         if LOG_RESPONSES:
             try:
@@ -357,9 +362,9 @@ class BidirectionalForwarder:
                 fname_ts = datetime.now().strftime(LOG_FNAME_TS_FORMAT)
                 log_filename = log_dir / f"{LOG_PREFIX}_{fname_ts}.log"
                 self.log_file = open(log_filename, 'ab')
-                print(f"[{self.client_addr}] 📝 Logging to {log_filename}")
+                print(f"[{self.rcv_client_con.addr}] 📝 Logging to {log_filename}")
             except Exception as e:
-                print(f"[{self.client_addr}] ⚠️  Could not open log: {e}")
+                print(f"[{self.rcv_client_con.addr}] ⚠️  Could not open log: {e}")
     
     def log_response(self, data):
         if self.log_file:
@@ -375,147 +380,179 @@ class BidirectionalForwarder:
             except OSError:
                 pass
     
-    def handle_server_a_data(self, data):
+    def handle_send_client_con_srv_a_data(self, data):
         if data and self.running:
             if LOG_RESPONSES:
                 self.log_response(data)
             try:
-                self.client_sock.sendall(data)
+                self.rcv_client_con.sock.sendall(data)
             except OSError as e:
-                print(f"[{self.client_addr}] Failed to send to client: {e!r}")
+                print(f"[{self.rcv_client_con.addr}] Failed to send to RcvClientCon: {e!r}")
                 self.running = False
 
-    def force_stop_due_to_server_a(self):
-        """Wake blocked I/O and end session when Server A is lost globally."""
+    def force_shutdown_rcv(self, *, notify: bool = False):
+        """Wake blocked RcvClientCon I/O (e.g. process shutdown). Optional disconnect line."""
         with self._stop_lock:
             if self._force_stopped:
                 return
             self._force_stopped = True
         self.running = False
         try:
-            if SEND_DISCONNECT_NOTIFICATION:
+            if notify and SEND_DISCONNECT_NOTIFICATION:
                 try:
-                    self.client_sock.sendall(DISCONNECT_MESSAGE.encode("utf-8", errors="replace"))
+                    self.rcv_client_con.sock.sendall(DISCONNECT_MESSAGE.encode("utf-8", errors="replace"))
                 except OSError:
                     pass
-            self.client_sock.shutdown(socket.SHUT_RDWR)
+            self.rcv_client_con.sock.shutdown(socket.SHUT_RDWR)
         except OSError:
             pass
 
-    def _maintain_server_b_loop(self):
-        """Background reconnects for Server B without dropping the client session."""
+    def _close_rcv_after_failed_srv_a(self):
+        """Drop RcvClientCon when SendClientConSrvA never connected (no disconnect banner)."""
+        self.running = False
+        try:
+            self.rcv_client_con.sock.close()
+        except OSError:
+            pass
+
+    def _maintain_send_client_con_srv_b_loop(self):
+        """Background reconnects for SendClientConSrvB without dropping the RcvClientCon session."""
         while self.running:
-            if not self.server_b.is_connected():
-                print(f"[{self.client_addr}] 🔄 Server B down — reconnecting to {SERVER_B[0]}:{SERVER_B[1]}...")
-                if self.server_b.connect():
-                    print(f"[{self.client_addr}] ✅ Server B connected")
+            if not self.send_client_con_srv_b.is_connected():
+                print(f"[{self.rcv_client_con.addr}] 🔄 SendClientConSrvB down — reconnecting to {SERVER_B[0]}:{SERVER_B[1]}...")
+                if self.send_client_con_srv_b.connect():
+                    print(f"[{self.rcv_client_con.addr}] ✅ SendClientConSrvB connected")
+                    self.session_registry.session_update(self._session_entry, srv_b="connected")
                 else:
                     time.sleep(RECONNECT_DELAY)
             else:
                 time.sleep(min(SELECT_TIMEOUT, 1.0))
 
     def run(self):
-        """Main forwarding logic"""
+        """Main forwarding logic: one SendClientConSrvA / SendClientConSrvB pair per RcvClientCon."""
+        session_entry = self.session_registry.session_add(self.rcv_client_con.addr)
+        self._session_entry = session_entry
+        self.session_registry.register_forwarder(self)
         try:
-            if not self.server_a.connect():
-                print(f"[{self.client_addr}] Failed to connect to Server A — notifying controller")
-                self.controller.on_server_a_unreachable()
-                self.terminate_client()
+            if not self.send_client_con_srv_a.connect():
+                self.session_registry.session_update(
+                    session_entry,
+                    srv_a="failed",
+                    srv_b="skipped",
+                )
+                print(
+                    f"[{self.rcv_client_con.addr}] ❌ SendClientConSrvA failed (e.g. SERVER_A busy or "
+                    f"single-connection limit) — dropping this RcvClientCon only."
+                )
+                self._close_rcv_after_failed_srv_a()
                 return
 
-            self.controller.register_forwarder(self)
-            self.server_b.connect()
+            self.session_registry.session_update(session_entry, srv_a="connected")
+
+            self.send_client_con_srv_b.connect()
+            self.session_registry.session_update(
+                session_entry,
+                srv_b="connected" if self.send_client_con_srv_b.is_connected() else "failed",
+            )
 
             b_maintainer = threading.Thread(
-                target=self._maintain_server_b_loop,
+                target=self._maintain_send_client_con_srv_b_loop,
                 daemon=True,
-                name=f"B-reconnect-{self.client_addr[0]}:{self.client_addr[1]}",
+                name=f"SendClientConSrvB-reconnect-{self.rcv_client_con.addr[0]}:{self.rcv_client_con.addr[1]}",
             )
             b_maintainer.start()
 
-            print(f"[{self.client_addr}] Session started - Server A connected")
+            print(f"[{self.rcv_client_con.addr}] Session started — SendClientConSrvA connected")
 
             while self.running:
                 try:
-                    ready, _, _ = select.select([self.client_sock], [], [], SELECT_TIMEOUT)
+                    ready, _, _ = select.select([self.rcv_client_con.sock], [], [], SELECT_TIMEOUT)
 
                     if ready:
-                        data = self.client_sock.recv(4096)
+                        data = self.rcv_client_con.sock.recv(4096)
                         if not data:
-                            print(f"[{self.client_addr}] Client disconnected normally")
+                            print(f"[{self.rcv_client_con.addr}] RcvClientCon disconnected normally")
                             break
 
-                        print(f"[{self.client_addr}] Sending {len(data)} bytes to Server A")
+                        print(f"[{self.rcv_client_con.addr}] Sending {len(data)} bytes to SendClientConSrvA")
 
-                        send_success = self.server_a.send(data)
+                        send_success = self.send_client_con_srv_a.send(data)
                         if not send_success:
-                            print(f"[{self.client_addr}] ❌ Server A connection lost!")
-                            self.controller.on_server_a_unreachable()
+                            print(f"[{self.rcv_client_con.addr}] ❌ SendClientConSrvA connection lost (this session only)")
+                            self.session_registry.session_update(session_entry, srv_a="closed")
+                            self.terminate_client()
                             break
 
-                        if self.server_b.is_connected():
-                            self.server_b.send(data)
+                        if self.send_client_con_srv_b.is_connected():
+                            self.send_client_con_srv_b.send(data)
 
-                    server_a_data = self.server_a.receive()
-                    if server_a_data is not None:
-                        self.handle_server_a_data(server_a_data)
-                    elif not self.server_a.is_connected():
-                        print(f"[{self.client_addr}] ❌ Server A disconnected!")
-                        self.controller.on_server_a_unreachable()
+                    srv_a_data = self.send_client_con_srv_a.receive()
+                    if srv_a_data is not None:
+                        self.handle_send_client_con_srv_a_data(srv_a_data)
+                    elif not self.send_client_con_srv_a.is_connected():
+                        print(f"[{self.rcv_client_con.addr}] ❌ SendClientConSrvA disconnected (this session only)")
+                        self.session_registry.session_update(session_entry, srv_a="closed")
+                        self.terminate_client()
                         break
 
                 except BlockingIOError:
                     continue
                 except ConnectionResetError:
-                    print(f"[{self.client_addr}] Client connection reset")
+                    print(f"[{self.rcv_client_con.addr}] RcvClientCon connection reset")
                     break
                 except Exception as e:
-                    print(f"[{self.client_addr}] Error: {e}")
+                    print(f"[{self.rcv_client_con.addr}] Error: {e}")
                     break
 
         except Exception as e:
-            print(f"[{self.client_addr}] Fatal error: {e}")
+            print(f"[{self.rcv_client_con.addr}] Fatal error: {e}")
         finally:
-            self.controller.unregister_forwarder(self)
+            self.session_registry.session_update(
+                session_entry,
+                srv_a="closed",
+                srv_b="closed",
+            )
+            self.session_registry.session_remove(session_entry)
+            self.session_registry.unregister_forwarder(self)
             self.cleanup()
     
     def terminate_client(self):
         """Terminate the client connection"""
-        print(f"[{self.client_addr}] 🔴 Terminating client connection...")
+        print(f"[{self.rcv_client_con.addr}] 🔴 Terminating client connection...")
         try:
             if SEND_DISCONNECT_NOTIFICATION:
                 try:
-                    self.client_sock.sendall(DISCONNECT_MESSAGE.encode("utf-8", errors="replace"))
+                    self.rcv_client_con.sock.sendall(DISCONNECT_MESSAGE.encode("utf-8", errors="replace"))
                     time.sleep(0.1)
                 except OSError:
                     pass
             
             # Close the client socket
-            self.client_sock.close()
+            self.rcv_client_con.sock.close()
         except OSError as e:
-            debug_print(f"[{self.client_addr}] terminate_client: {e!r}")
+            debug_print(f"[{self.rcv_client_con.addr}] terminate_client: {e!r}")
         self.running = False
     
     def cleanup(self):
-        print(f"[{self.client_addr}] Cleaning up...")
+        print(f"[{self.rcv_client_con.addr}] Cleaning up...")
         self.running = False
-        self.server_a.stop()
-        self.server_b.stop()
+        self.send_client_con_srv_a.stop()
+        self.send_client_con_srv_b.stop()
         
         if self.log_file:
             try:
                 self.log_file.close()
             except OSError as e:
-                debug_print(f"[{self.client_addr}] log close: {e!r}")
+                debug_print(f"[{self.rcv_client_con.addr}] log close: {e!r}")
         
         # Ensure client socket is closed
-        if self.client_sock:
+        if self.rcv_client_con.sock:
             try:
-                self.client_sock.close()
+                self.rcv_client_con.sock.close()
             except OSError as e:
-                debug_print(f"[{self.client_addr}] client close in cleanup: {e!r}")
+                debug_print(f"[{self.rcv_client_con.addr}] client close in cleanup: {e!r}")
         
-        print(f"[{self.client_addr}] Cleanup complete")
+        print(f"[{self.rcv_client_con.addr}] Cleanup complete")
 
 def main():
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -528,49 +565,38 @@ def main():
         sys.exit(1)
 
     server.listen(5)
-    controller = ServiceController()
+    session_registry = SessionRegistry()
 
     print(f"🚀 TCP Forwarder listening on port {LISTEN_PORT}")
-    print(f"📡 Server A: {SERVER_A[0]}:{SERVER_A[1]} (bidirectional — REQUIRED; accept pauses if down)")
-    print(f"📡 Server B: {SERVER_B[0]}:{SERVER_B[1]} (receive-only — reconnects per client without dropping clients)")
+    print(f"📡 SERVER_A {SERVER_A[0]}:{SERVER_A[1]} — each RcvClientCon opens its own SendClientConSrvA")
+    print(f"📡 SERVER_B {SERVER_B[0]}:{SERVER_B[1]} — optional; SendClientConSrvB may reconnect per session")
+    print("\nWaiting for RcvClientCon connections (no startup probe to SERVER_A)...\n")
 
     try:
         while True:
             try:
-                wait_until_server_a_available()
+                readable, _, _ = select.select([server], [], [], 1.0)
+            except InterruptedError:
+                continue
             except KeyboardInterrupt:
-                print("\n\n🛑 Shutting down...")
-                break
+                raise
+            if not readable:
+                continue
+            try:
+                client_sock, client_addr = server.accept()
+            except OSError as e:
+                debug_print(f"accept: {e!r}")
+                continue
 
-            controller.begin_accepting_clients()
-            print("\nWaiting for clients (Server A is up)...\n")
-
-            while controller.accept_allowed.is_set():
-                try:
-                    readable, _, _ = select.select([server], [], [], 1.0)
-                except InterruptedError:
-                    continue
-                except KeyboardInterrupt:
-                    raise
-                if not controller.accept_allowed.is_set():
-                    print("⏸️  Pausing accepts — recovering Server A...")
-                    break
-                if not readable:
-                    continue
-                try:
-                    client_sock, client_addr = server.accept()
-                except OSError as e:
-                    debug_print(f"accept: {e!r}")
-                    continue
-
-                print(f"\n📞 Client connected from {client_addr[0]}:{client_addr[1]}")
-                forwarder = BidirectionalForwarder(client_sock, client_addr, controller)
-                thread = threading.Thread(target=forwarder.run, daemon=True)
-                thread.start()
+            print(f"\n📞 RcvClientCon from {client_addr[0]}:{client_addr[1]}")
+            rcv_client_con = RcvClientCon(client_sock, client_addr)
+            forwarder = BidirectionalForwarder(rcv_client_con, session_registry)
+            thread = threading.Thread(target=forwarder.run, daemon=True)
+            thread.start()
     except KeyboardInterrupt:
         print("\n\n🛑 Shutting down...")
     finally:
-        controller.shutdown_for_exit()
+        session_registry.shutdown_for_exit()
         try:
             server.close()
         except OSError as e:

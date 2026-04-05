@@ -1,55 +1,58 @@
 #!/usr/bin/env python3
 """
-Configuration file for TCP Forwarder
-Edit this file to change the forwarder behavior
+Configuration for IPSignalDuplicatorServer.
+
+Code naming (see README):
+  RcvClientCon          — accepted TCP client on LISTEN_PORT
+  SendClientConSrvA/B   — outbound connections to SERVER_A / SERVER_B
 """
 
 # ============================================================================
 # Network Configuration
 # ============================================================================
 
-# Port the forwarder listens on (telnet client connects here)
+# Port on which the forwarder accepts RcvClientCon connections (telnet, nc, etc.)
 LISTEN_PORT = 8010
 
-# Server A - Bidirectional server (REQUIRED)
-# If this server disconnects, the client will be terminated
+# Upstream endpoint for SendClientConSrvA (REQUIRED per session, bidirectional).
+# Each new RcvClientCon tries its own TCP connect here. If connect fails (busy host,
+# single-connection server, etc.), only that RcvClientCon is dropped; others are unaffected.
 # SERVER_A = ('192.168.1.10', 23)   # (IP address, port)
 SERVER_A = ('192.168.1.94', 9996)   # (IP address, port)
 
-# Server B - Receive-only server (OPTIONAL)
-# This server only receives data, responses are ignored
+# Upstream endpoint for SendClientConSrvB (OPTIONAL, receive-only duplicate path).
+# Responses from this path are not relayed back to RcvClientCon.
 SERVER_B = ('192.168.1.94', 9999)   # (IP address, port)
 
 # ============================================================================
 # Connection Settings
 # ============================================================================
 
-# Connection timeout in seconds
+# Seconds to wait when opening each SendClientConnection (TCP connect).
 CONNECT_TIMEOUT = 5
 
-# Delay between TCP reconnect attempts (seconds). Used for Server A recovery probes
-# and for Server B reconnection when a client session is active.
+# Seconds between SendClientConSrvB reconnect attempts in the per-session maintainer thread.
 RECONNECT_DELAY = 5
 
-# Maximum reconnection attempts for ConnectionManager.reconnect() (0 = unlimited).
-# Per-client Server B maintainer uses simple retries with RECONNECT_DELAY.
+# Maximum reconnection attempts for SendClientConnection.reconnect() (0 = unlimited).
+# The SendClientConSrvB maintainer uses simple connect retries with RECONNECT_DELAY.
 MAX_RECONNECT_ATTEMPTS = 0
 
-# Main-loop select() timeout in seconds (poll rate for client + Server A I/O).
-# Lower = more responsive; higher = less CPU wakeups.
+# Main forwarder loop: select() timeout in seconds (poll rate for RcvClientCon +
+# SendClientConSrvA I/O). Lower = more responsive; higher = less CPU wakeups.
 SELECT_TIMEOUT = 0.5
 
 # ============================================================================
 # Logging Configuration
 # ============================================================================
 
-# Enable/disable logging of Server A responses
+# If True, log bytes received from SendClientConSrvA (upstream A) under LOG_DIRECTORY.
 LOG_RESPONSES = True
 
-# Directory for log files (will be created if doesn't exist)
+# Directory for log files (will be created if it does not exist)
 LOG_DIRECTORY = "logs"
 
-# Log file prefix (actual file: {LOG_PREFIX}_{timestamp}.log)
+# Log file prefix (actual file: {LOG_PREFIX}_{LOG_FNAME_TS_FORMAT}.log)
 LOG_PREFIX = "server_a_responses"
 
 # Timestamp inside each log line (not the file name)
@@ -66,13 +69,14 @@ LOG_FNAME_TS_FORMAT = "%Y-%m-%d"
 # Advanced Settings
 # ============================================================================
 
-# Send disconnect notification to client when Server A disconnects
+# If True, send DISCONNECT_MESSAGE to RcvClientCon when that session's SendClientConSrvA is lost
+# after it had connected (not used when SendClientConSrvA never connects).
 SEND_DISCONNECT_NOTIFICATION = True
 
 # Reserved for future periodic health logic (not used by the main loop today).
 HEALTH_CHECK_INTERVAL = 2
 
-# Disconnect notification message
+# Message sent to RcvClientCon before shutdown when upstream A is unavailable.
 DISCONNECT_MESSAGE = "\r\n[ERROR: Server A disconnected - terminating connection]\r\n"
 
 # Enable debug output (more verbose logging)
