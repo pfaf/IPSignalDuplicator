@@ -27,11 +27,17 @@ SERVER_B = ('192.168.1.94', 9999)   # (IP address, port)
 # Connection timeout in seconds
 CONNECT_TIMEOUT = 5
 
-# Reconnection delay for optional Server B (seconds)
+# Delay between TCP reconnect attempts (seconds). Used for Server A recovery probes
+# and for Server B reconnection when a client session is active.
 RECONNECT_DELAY = 5
 
-# Maximum reconnection attempts for Server B (0 = unlimited)
+# Maximum reconnection attempts for ConnectionManager.reconnect() (0 = unlimited).
+# Per-client Server B maintainer uses simple retries with RECONNECT_DELAY.
 MAX_RECONNECT_ATTEMPTS = 0
+
+# Main-loop select() timeout in seconds (poll rate for client + Server A I/O).
+# Lower = more responsive; higher = less CPU wakeups.
+SELECT_TIMEOUT = 0.5
 
 # ============================================================================
 # Logging Configuration
@@ -46,13 +52,14 @@ LOG_DIRECTORY = "logs"
 # Log file prefix (actual file: {LOG_PREFIX}_{timestamp}.log)
 LOG_PREFIX = "server_a_responses"
 
-# Timestamp format for log entries
+# Timestamp inside each log line (not the file name)
 # Format options:
 #   "%Y-%m-%d %H:%M:%S.%f"  -> 2024-01-15 14:30:25.123456
 #   "%Y-%m-%d %H:%M:%S"     -> 2024-01-15 14:30:25
 #   "%H:%M:%S.%f"           -> 14:30:25.123456
-#   "%Y%m%d_%H%M%S"         -> 20240115_143025
 LOG_TIMESTAMP_FORMAT = "%Y-%m-%d %H:%M:%S.%f"
+
+# Date/time fragment for the log file name: {LOG_PREFIX}_{this}.log
 LOG_FNAME_TS_FORMAT = "%Y-%m-%d"
 
 # ============================================================================
@@ -62,7 +69,7 @@ LOG_FNAME_TS_FORMAT = "%Y-%m-%d"
 # Send disconnect notification to client when Server A disconnects
 SEND_DISCONNECT_NOTIFICATION = True
 
-# Health check interval for Server A (seconds)
+# Reserved for future periodic health logic (not used by the main loop today).
 HEALTH_CHECK_INTERVAL = 2
 
 # Disconnect notification message
