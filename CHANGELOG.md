@@ -5,6 +5,13 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.1] - 2026-04-05
+
+### Changed
+
+- **SendClientConSrvB:** detect peer disconnect via `select` + non-blocking inbound probe; update session status and wake reconnect thread.
+- **SendClientConSrvB:** on RcvClientCon data, inline connect/send retries (`SRV_B_INLINE_*`), then a bounded pending queue flushed when SERVER_B returns; maintainer uses shorter waits when data is pending.
+
 ## [0.7.0] - 2026-04-05
 
 Pre-release: not yet validated in production; semantic **0.x** until real-world testing stabilizes the behaviour.

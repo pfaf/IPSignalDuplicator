@@ -37,8 +37,12 @@ Edit **`config.py`** in the same directory as the server script.
 | `SERVER_A` | `(host, port)` for **SendClientConSrvA** — each new Rcv client attempts its own connect; success depends on upstream policy (e.g. single-connection servers). |
 | `SERVER_B` | `(host, port)` for **SendClientConSrvB** — optional; reconnects per session if it drops. |
 | `CONNECT_TIMEOUT` | Seconds to wait when opening each **SendClientConnection**. |
-| `RECONNECT_DELAY` | Delay between **SendClientConSrvB** reconnect attempts in the maintainer thread. |
-| `SELECT_TIMEOUT` | Poll interval (seconds) for Rcv + Srv A I/O in the session main loop. |
+| `RECONNECT_DELAY` | Delay between **SendClientConSrvB** reconnect attempts when idle (no pending data). |
+| `SRV_B_INLINE_RECONNECT_ATTEMPTS` | Per chunk: connect+send retries on the main thread before queueing to SERVER_B. |
+| `SRV_B_INLINE_RETRY_DELAY_SEC` | Pause between those inline attempts. |
+| `SRV_B_PENDING_MAX_CHUNKS` | Max queued chunks for SERVER_B when it is down (oldest dropped when full). |
+| `SRV_B_MAINTAINER_IDLE_SEC` | When B is up and the queue is empty, how often the maintainer thread wakes to check. |
+| `SELECT_TIMEOUT` | Poll interval (seconds) for Rcv + Srv A (+ Srv B readability probe) in the session main loop. |
 | `LOG_RESPONSES` | If `True`, log data read from **SendClientConSrvA** under `LOG_DIRECTORY`. |
 | `LOG_DIRECTORY`, `LOG_PREFIX` | Log folder and file name prefix (`{LOG_PREFIX}_{LOG_FNAME_TS_FORMAT}.log`). |
 | `LOG_TIMESTAMP_FORMAT` | Timestamp format inside each log line. |

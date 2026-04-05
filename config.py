@@ -31,8 +31,20 @@ SERVER_B = ('192.168.1.94', 9999)   # (IP address, port)
 # Seconds to wait when opening each SendClientConnection (TCP connect).
 CONNECT_TIMEOUT = 5
 
-# Seconds between SendClientConSrvB reconnect attempts in the per-session maintainer thread.
+# Seconds between SendClientConSrvB reconnect attempts when idle (no pending data).
 RECONNECT_DELAY = 5
+
+# When RcvClientCon sends data, try this many connect+send cycles before queueing for the maintainer.
+SRV_B_INLINE_RECONNECT_ATTEMPTS = 10
+
+# Delay between those inline attempts (seconds).
+SRV_B_INLINE_RETRY_DELAY_SEC = 0.1
+
+# Max chunks queued for SendClientConSrvB if upstream is down (oldest dropped when full).
+SRV_B_PENDING_MAX_CHUNKS = 128
+
+# When SendClientConSrvB is up and the pending queue is empty, maintainer sleeps up to this (seconds).
+SRV_B_MAINTAINER_IDLE_SEC = 2.0
 
 # Maximum reconnection attempts for SendClientConnection.reconnect() (0 = unlimited).
 # The SendClientConSrvB maintainer uses simple connect retries with RECONNECT_DELAY.

@@ -17,15 +17,16 @@ reconnect in the background without dropping the Rcv session.
 Run: ``python IPSignalDuplicatorServer.py`` (configure ``config.py`` first). For systemd, see README.md.
 """
 
-__version__ = "0.7.0"
+__version__ = "0.7.1"
 
-import socket
-import select
-import threading
-import sys
-import time
+import collections
 import errno
 import os
+import select
+import socket
+import sys
+import threading
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -55,6 +56,10 @@ DISCONNECT_MESSAGE = config.DISCONNECT_MESSAGE
 DEBUG = config.DEBUG
 SELECT_TIMEOUT = config.SELECT_TIMEOUT
 LOG_FNAME_TS_FORMAT = config.LOG_FNAME_TS_FORMAT
+SRV_B_INLINE_RECONNECT_ATTEMPTS = config.SRV_B_INLINE_RECONNECT_ATTEMPTS
+SRV_B_INLINE_RETRY_DELAY_SEC = config.SRV_B_INLINE_RETRY_DELAY_SEC
+SRV_B_PENDING_MAX_CHUNKS = config.SRV_B_PENDING_MAX_CHUNKS
+SRV_B_MAINTAINER_IDLE_SEC = config.SRV_B_MAINTAINER_IDLE_SEC
 
 # Serialize writes when multiple clients share the same daily log file
 _log_write_lock = threading.Lock()
@@ -246,8 +251,42 @@ class SendClientConnection:
     def is_connected(self):
         with self.lock:
             return self.sock is not None
-    
-    
+
+    def discard_inbound_probe_disconnect(self):
+        """Non-blocking: if socket is readable, recv. Empty recv => peer closed; else discard data."""
+        with self.lock:
+            if not self.sock:
+                return
+            try:
+                self.sock.settimeout(0)
+                while True:
+                    try:
+                        chunk = self.sock.recv(65536)
+                    except BlockingIOError:
+                        break
+                    if not chunk:
+                        print(f"🔌 [{self.name}] Remote host closed connection (inbound probe)")
+                        try:
+                            self.sock.close()
+                        except OSError as e:
+                            debug_print(f"[{self.name}] probe close: {e!r}")
+                        self.sock = None
+                        break
+            except OSError as e:
+                debug_print(f"[{self.name}] inbound probe: {e!r}")
+                try:
+                    if self.sock:
+                        self.sock.close()
+                except OSError:
+                    pass
+                self.sock = None
+            finally:
+                if self.sock:
+                    try:
+                        self.sock.settimeout(None)
+                    except OSError:
+                        pass
+
     def reconnect(self):
         if not self.running:
             return False
@@ -292,7 +331,11 @@ class BidirectionalForwarder:
 
         self.send_client_con_srv_a = SendClientConSrvA(self.handle_send_client_con_srv_a_data)
         self.send_client_con_srv_b = SendClientConSrvB()
-        
+        self._srv_b_pending = collections.deque()
+        self._srv_b_pending_lock = threading.Lock()
+        self._srv_b_wake = threading.Event()
+        self._session_entry = None
+
         if LOG_RESPONSES:
             try:
                 log_dir = Path(LOG_DIRECTORY)
@@ -353,24 +396,95 @@ class BidirectionalForwarder:
         except OSError:
             pass
 
+    def _srv_b_mark_disconnected(self):
+        entry = self._session_entry
+        if entry is not None:
+            self.session_registry.session_update(entry, srv_b="disconnected")
+
+    def _enqueue_srv_b_pending(self, data):
+        if not data:
+            return
+        with self._srv_b_pending_lock:
+            while len(self._srv_b_pending) >= SRV_B_PENDING_MAX_CHUNKS:
+                self._srv_b_pending.popleft()
+                debug_print(f"[{self.rcv_client_con.addr}] SendClientConSrvB pending queue overflow, dropped oldest chunk")
+            self._srv_b_pending.append(data)
+        self._srv_b_wake.set()
+
+    def _flush_srv_b_pending(self):
+        while self.running and self.send_client_con_srv_b.is_connected():
+            with self._srv_b_pending_lock:
+                if not self._srv_b_pending:
+                    return
+                chunk = self._srv_b_pending.popleft()
+            if not self.send_client_con_srv_b.send(chunk):
+                with self._srv_b_pending_lock:
+                    self._srv_b_pending.appendleft(chunk)
+                self._srv_b_mark_disconnected()
+                self._srv_b_wake.set()
+                return
+
+    def _forward_to_srv_b(self, data):
+        """Send to SendClientConSrvB: inline reconnect retries, then queue for maintainer thread."""
+        if not data:
+            return
+        for _ in range(SRV_B_INLINE_RECONNECT_ATTEMPTS):
+            if not self.running:
+                return
+            if self.send_client_con_srv_b.is_connected():
+                if self.send_client_con_srv_b.send(data):
+                    return
+                self._srv_b_mark_disconnected()
+                self._srv_b_wake.set()
+                time.sleep(SRV_B_INLINE_RETRY_DELAY_SEC)
+                continue
+            if self.send_client_con_srv_b.connect():
+                self.session_registry.session_update(self._session_entry, srv_b="connected")
+                if self.send_client_con_srv_b.send(data):
+                    self._flush_srv_b_pending()
+                    return
+                self._srv_b_mark_disconnected()
+                self._srv_b_wake.set()
+            time.sleep(SRV_B_INLINE_RETRY_DELAY_SEC)
+        self._enqueue_srv_b_pending(data)
+
     def _maintain_send_client_con_srv_b_loop(self):
-        """Background reconnects for SendClientConSrvB without dropping the RcvClientCon session."""
+        """Reconnect SendClientConSrvB and flush pending chunks when SERVER_B was down."""
         while self.running:
-            if not self.send_client_con_srv_b.is_connected():
-                print(f"[{self.rcv_client_con.addr}] 🔄 SendClientConSrvB down — reconnecting to {SERVER_B[0]}:{SERVER_B[1]}...")
-                if self.send_client_con_srv_b.connect():
-                    print(f"[{self.rcv_client_con.addr}] ✅ SendClientConSrvB connected")
-                    self.session_registry.session_update(self._session_entry, srv_b="connected")
-                else:
-                    time.sleep(RECONNECT_DELAY)
+            if self.send_client_con_srv_b.is_connected():
+                self._flush_srv_b_pending()
+
+            with self._srv_b_pending_lock:
+                pending = len(self._srv_b_pending) > 0
+
+            if self.send_client_con_srv_b.is_connected():
+                if pending:
+                    continue
+                if self._srv_b_wake.wait(timeout=SRV_B_MAINTAINER_IDLE_SEC):
+                    self._srv_b_wake.clear()
+                continue
+
+            timeout = SRV_B_INLINE_RETRY_DELAY_SEC if pending else RECONNECT_DELAY
+            if self._srv_b_wake.wait(timeout=timeout):
+                self._srv_b_wake.clear()
+
+            if not self.running:
+                break
+
+            print(f"[{self.rcv_client_con.addr}] 🔄 SendClientConSrvB down — reconnecting to {SERVER_B[0]}:{SERVER_B[1]}...")
+            if self.send_client_con_srv_b.connect():
+                print(f"[{self.rcv_client_con.addr}] ✅ SendClientConSrvB connected")
+                self.session_registry.session_update(self._session_entry, srv_b="connected")
+                self._flush_srv_b_pending()
             else:
-                time.sleep(min(SELECT_TIMEOUT, 1.0))
+                self.session_registry.session_update(self._session_entry, srv_b="disconnected")
 
     def run(self):
         """Main forwarding logic: one SendClientConSrvA / SendClientConSrvB pair per RcvClientCon."""
         session_entry = self.session_registry.session_add(self.rcv_client_con.addr)
         self._session_entry = session_entry
         self.session_registry.register_forwarder(self)
+        self._srv_b_wake.clear()
         try:
             if not self.send_client_con_srv_a.connect():
                 self.session_registry.session_update(
@@ -404,9 +518,23 @@ class BidirectionalForwarder:
 
             while self.running:
                 try:
-                    ready, _, _ = select.select([self.rcv_client_con.sock], [], [], SELECT_TIMEOUT)
+                    rlist = [self.rcv_client_con.sock]
+                    b_sock = None
+                    if self.send_client_con_srv_b.is_connected():
+                        with self.send_client_con_srv_b.lock:
+                            b_sock = self.send_client_con_srv_b.sock
+                        if b_sock is not None:
+                            rlist.append(b_sock)
 
-                    if ready:
+                    ready, _, _ = select.select(rlist, [], [], SELECT_TIMEOUT)
+
+                    if b_sock is not None and b_sock in ready:
+                        self.send_client_con_srv_b.discard_inbound_probe_disconnect()
+                        if not self.send_client_con_srv_b.is_connected():
+                            self._srv_b_mark_disconnected()
+                            self._srv_b_wake.set()
+
+                    if self.rcv_client_con.sock in ready:
                         data = self.rcv_client_con.sock.recv(4096)
                         if not data:
                             print(f"[{self.rcv_client_con.addr}] RcvClientCon disconnected normally")
@@ -421,8 +549,7 @@ class BidirectionalForwarder:
                             self.terminate_client()
                             break
 
-                        if self.send_client_con_srv_b.is_connected():
-                            self.send_client_con_srv_b.send(data)
+                        self._forward_to_srv_b(data)
 
                     srv_a_data = self.send_client_con_srv_a.receive()
                     if srv_a_data is not None:
